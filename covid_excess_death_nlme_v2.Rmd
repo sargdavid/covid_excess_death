@@ -14,6 +14,13 @@ output:
 
 Date: `r date()`
 
+Meeting 10/28/22
+Javier:
+1. use "decompose" function (Fourier transform)
+2. find top 3 frequencies (for 12-month frequency)
+3. remove 12-months signal
+4. run 'decompose' again for longer frequency (24 or 36 month?)
+
 # Setup
 ```{r setup}
 require(data.table)
@@ -21,6 +28,7 @@ require(ggplot2)
 require(nlme)
 ```
 
+# Data
 ```{r}
 dt1 <- data.table(read.csv("data/JOINT_HistRec_ETS_Results_short.csv"))
 colnames(dt1)
@@ -39,22 +47,27 @@ dt2 <- dt1[, .(Date = as.Date(paste0(dt1$Month_Code,
                                             pattern = "#",
                                             replacement = "")),
                
-               Rate = 10^6*(dt1$Deaths + 1)/(daysmonth*(Population + 1)))]
+               Rate = 10^5*(dt1$Deaths + 1)/(daysmonth*(Population + 1)))]
 ```
 
 ```{r}
 levels(dt2$State)
 levels(dt2$Cause)
 ```
+# Remove records after 2022-07-01 and all COVID deaths
+```{r}
+dt2 <- droplevels(dt2[Date < "2022-07-01" &
+                        Cause != "COVID-19 (U07.1)", ]) 
+```
 
 # Training/Testing/COVID
 ```{r}
 dt2$set <- "trn"
 
-dt2$set[dt2$Date >= "2019-02-01" &
-          dt2$Date < "2019-03-01"] <- "tst"
+dt2$set[dt2$Date >= "2019-03-01" &
+          dt2$Date < "2020-03-01"] <- "tst"
 
-dt2$set[dt2$Date >= "2019-03-01"] <- "cvd"
+dt2$set[dt2$Date >= "2020-03-01"] <- "cvd"
 ```
 
 # Output lists
@@ -62,7 +75,7 @@ dt2$set[dt2$Date >= "2019-03-01"] <- "cvd"
 betas <- list()
 mape <- list()
 mape_state <- list()
-models <- list()
+dtt <- list()
 ```
 
 # Modeling
@@ -71,8 +84,7 @@ for (i in 1:nlevels(dt2$Cause)) {
   # Subset data
   cod <- levels(dt2$Cause)[i]
   
-  tmp <- droplevels(dt2[Date < "2022-07-01" &
-                          Cause == cod,])
+  tmp <- droplevels(dt2[Cause == cod,])
   
   tmp$dt <- as.numeric(tmp$Date)
   tmp$dt_sqr <- tmp$dt^2
@@ -117,9 +129,12 @@ for (i in 1:nlevels(dt2$Cause)) {
                                       b5 = 0.018))) # wave length(> 1 shortens, < 1 elongates))
   })
   if(class(m3)[1] != "try-error") {
-  
+    
     tmp$prd3 <- predict(m3,
                         newdata = tmp)
+    
+    dtt[[i]] <- tmp
+    
     # Save coefficients
     betas[[i]] <- m3$coefficients$fixed
     
@@ -160,7 +175,7 @@ names(betas) <- levels(dt2$Cause)
 
 lapply(X = betas,
        FUN = is.null)
-betas[[8]] <- NULL
+betas$`Malignant neoplasms (C00-C97)` <- NULL
 
 t1 <- do.call("rbind",
               betas)
@@ -175,9 +190,12 @@ write.csv(t1,
 # Table 2: MAPE, all states
 ```{r}
 names(mape) <- levels(dt2$Cause)
+
+mape$`Malignant neoplasms (C00-C97)` <- NULL
+
 t2 <- rbindlist(mape,
                 use.names = TRUE)
-t2 <- data.table(`Cause of Death` = rep(levels(dt2$Cause),
+t2 <- data.table(`Cause of Death` = rep(names(mape),
                                         each = 3),
                  t2)
 t2$set <- factor(t2$set,
@@ -204,11 +222,13 @@ write.csv(t2,
 out <- list()
 for (i in 1:length(mape_state)) {
   out[[i]] <- data.table(`Cause of Death` = levels(dt2$Cause)[i],
-                                mape_state[[i]])
+                         mape_state[[i]])
 }
 
-out[[4]] <- NULL
-out[[7]] <- NULL
+names(out) <- levels(dt2$Cause)
+
+out$`Malignant neoplasms (C00-C97)` <- NULL
+
 t3 <- rbindlist(out)
 
 t3$set <- factor(t3$set,
@@ -229,6 +249,95 @@ write.csv(t3,
           file = "tmp/mape_state.csv",
           row.names = FALSE)
 ```
+
+# Save data
+```{r}
+dt3 <- rbindlist(dtt)
+```
+
+# Custom plots
+```{r,fig.width=6,fig.height=4}
+tmp <- dt3[Cause == "Diseases of heart (I00-I09,I11,I13,I20-I51)" &
+             State == "New Jersey"]
+
+p1 <- ggplot(tmp,
+             aes(x = Date,
+                 y = Rate,
+                 group = Cause)) +
+  geom_ribbon(aes(xmin = min(tmp$Date[tmp$set == "tst"]),
+                  xmax = max(tmp$Date[tmp$set == "tst"])),
+              orientation = "y",
+              fill = "green",
+              alpha = 0.3) +
+  geom_line(color = "gray") +
+  geom_line(aes(x = Date,
+                y = prd1),
+            color = "red") +
+  scale_x_continuous(breaks = seq.Date(from = min(tmp$Date),
+                                       to = max(tmp$Date),
+                                       by = 365.25)) +
+  ggtitle(paste(tmp$Cause[1],
+                tmp$State[1],
+                sep = ": ")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1)) +
+  geom_line(data = tmp,
+            aes(x = Date,
+                y = prd3),
+            color = "blue")
+p1
+```
+
+```{r}
+# m2 <- spectrum(Date ~ Rate,
+#                data = tmp)
+
+spectrum(tmp$Rate[tmp$Date < "2020-03-01"])
+abline(v = 1/12.5, col = 2, lty = 2)
+# abline(v = 1/24, col = 2)
+# abline(v = 1/36, col = 3)
+# abline(v = 1/2/c(10:16), col = 3, lty = 2)
+abline(v = 1/c(6, 7.75, 26), col = 3, lty = 3)
+```
+
+```{r}
+xx <- ts(data = tmp$Rate,
+         start = c(2010, 1),
+         end = c(2020, 3),
+         frequency = 12)
+
+m3 <- decompose(xx)
+summary(m3)
+m3$seasonal
+plot(m3)
+```
+
+```{r}
+xx <- data.table(x = seq(0, 20, by = 0.1))
+xx$y <- sin(xx$x)
+plot(xx$y ~ xx$x, type = "l")
+
+xx$y2 <- sin(xx$x) + 3*sin(2*xx$x)
+plot(xx$y2 ~ xx$x, type = "l")
+
+xxx <- ts(data = xx$y2,
+         start = 0,
+         end = 20,
+         frequency = 10)
+
+m3 <- decompose(xxx)
+plot(m3)
+
+plot(xx$y ~ xx$x, type = "l")
+plot(xx$y2 ~ xx$x, type = "l")
+plot(xxx)
+plot(m3)
+
+m3$type
+```
+
 
 # Session
 ```{r}
