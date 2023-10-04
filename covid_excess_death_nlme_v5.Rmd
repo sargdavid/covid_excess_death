@@ -71,11 +71,18 @@ dt2 <- droplevels(dt2[Date < "2022-07-01", ])
 ```
 
 ## State populations
-```{r,fig.height=10,fig.width=15}
+```{r}
 tmp <- unique(dt2[, c("Date",
                       "State",
                       "Population")])
+range(tmp$Date)
 
+tmp[, pop2010 := Population[Date == "2010-01-01"],
+    by = State]
+tmp[, pop2010pct := 100*Population/pop2010]
+```
+
+```{r,fig.height=10,fig.width=15}
 p1 <- ggplot(tmp,
              aes(x = Date,
                  y = Population)) +
@@ -102,6 +109,37 @@ graphics.off()
 
 p1
 ```
+
+```{r,fig.height=10,fig.width=15}
+p2 <- ggplot(tmp,
+             aes(x = Date,
+                 y = pop2010pct)) +
+  facet_wrap(~ State) +
+  geom_hline(yintercept = 100,
+             linetype = "dashed",
+             color = "red") +
+  geom_line() +
+  scale_x_continuous(breaks = seq.Date(from = min(tmp$Date),
+                                       to = max(tmp$Date),
+                                       by = 365.25)) +
+  ggtitle("Population (% January 2010)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+
+tiff(filename = "tmp/population_pct_jan010.tiff",
+     height = 10,
+     width = 15,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p2)
+graphics.off()
+
+p2
+```
+
 
 ## Daily death by State
 ```{r}
@@ -400,33 +438,110 @@ save(dt3,
      file = "tmp/dt3.RData")
 ```
 
-# Excess Death over the COVID-19 months
+# Excess Death
 ```{r}
 dt3[, Deaths_prd := prd3*daysmonth*Population*10^(-5)]
+```
 
-ed <- dt3[set == "cvd",
+## Over the COVID-19 months
+```{r}
+ed_cvd <- dt3[set == "cvd",
           .(excess_death_pct_prd = 100*sum(Deaths - Deaths_prd)/sum(Deaths_prd)),
           by = list(State,
                     Cause)]
 
-summary(ed)
-levels(ed$State)
-levels(ed$Cause)
-range(ed$excess_death_pct_prd)
+# summary(ed_cvd)
+# levels(ed_cvd$State)
+# levels(ed_cvd$Cause)
+# range(ed_cvd$excess_death_pct_prd)
+# 
+# ggplot(ed_cvd,
+#        aes(x = excess_death_pct_prd)) +
+#   facet_wrap(~ State,
+#              scale = "free_x") +
+#                geom_histogram() +
+#   theme_bw()
+# 
+# ggplot(ed_cvd,
+#        aes(x = excess_death_pct_prd)) +
+#   facet_wrap(~ Cause,
+#              scale = "free_x") +
+#                geom_histogram() +
+#   theme_bw()
 
-ggplot(ed,
-       aes(x = excess_death_pct_prd)) +
-  facet_wrap(~ State,
-             scale = "free_x") +
-               geom_histogram() +
-  theme_bw()
+t_ed_cvd <- dcast.data.table(data = ed_cvd,
+                             State ~ Cause,
+                             value.var = "excess_death_pct_prd")
+write.csv(t_ed_cvd,
+          file = "tmp/t_ed_cvd.csv",
+          row.names = FALSE)
+t_ed_cvd
+```
 
-ggplot(ed,
-       aes(x = excess_death_pct_prd)) +
-  facet_wrap(~ Cause,
-             scale = "free_x") +
-               geom_histogram() +
-  theme_bw()
+## Over the Testing months
+```{r}
+ed_tst <- dt3[set == "tst",
+              .(excess_death_pct_prd = 100*sum(Deaths - Deaths_prd)/sum(Deaths_prd)),
+              by = list(State,
+                        Cause)]
+
+t_ed_tst <- dcast.data.table(data = ed_tst,
+                             State ~ Cause,
+                             value.var = "excess_death_pct_prd")
+write.csv(t_ed_tst,
+          file = "tmp/t_ed_tst.csv",
+          row.names = FALSE)
+t_ed_tst
+```
+
+## Plot
+```{r,fig.height=8,fig.width=8}
+ci_tst <- ed_tst[, .(mu = mean(excess_death_pct_prd),
+                     sem = sd(excess_death_pct_prd)/sqrt(.N)),
+                 by = Cause]
+ci_tst[, llci := mu - 1.96*sem]
+ci_tst[, ulci := mu + 1.96*sem]
+ci_tst
+
+p1 <- ggplot(ci_tst,
+             aes(x = Cause,
+                 y = mu,
+                 ymin = llci,
+                 ymax = ulci)) +
+  geom_hline(yintercept = 0,
+             linetype = "dashed",
+             color = "red") +
+  geom_errorbar(width = 0.2) +
+  geom_point(shape = 21,
+             size = 3,
+             fill = "white") +
+  geom_point(data = ed_cvd,
+             aes(x = Cause,
+                 y = excess_death_pct_prd,
+                 group = State),
+             shape = 21,
+             size = 2,
+             fill = "green",
+             alpha = 0.5,
+             position = position_dodge(0.3),
+             inherit.aes = FALSE) +
+  scale_y_continuous("% Predicted") +
+  ggtitle("") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45,
+                                   hjust = 1))
+
+tiff(filename = paste0("tmp/tst_cvd_pctextradeath.tiff"),
+     height = 8,
+     width = 8,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
 ```
 
 ## Transform data with DNAMR::trans2t
@@ -459,7 +574,7 @@ write.csv(dt_pca,
 
 ```{r}
 m1 <- prcomp(dt_pca[, -1],
-             center = FALSE,
+             center = TRUE,
              scale. = FALSE)
 summary(m1)
 ```
@@ -496,8 +611,8 @@ u.axis.labs <- paste(colnames(dt.rot)[1:2],
 u.axis.labs
 ```
 
-```{r,fig.width=10,fig.height=10}
-scl <- 30
+```{r,fig.width=7,fig.height=7}
+scl <- 35
 
 p1 <- ggplot(data = dt.rot,
              aes(x = PC1,
@@ -521,20 +636,22 @@ p1 <- ggplot(data = dt.rot,
                linewidth = 1.2) +
   geom_text(aes(x = 1.1*scl*PC1,
                 y = 1.1*scl*PC2,
-                label = dt.rot$feat),
-            size = 3,
+                label = substr(x = dt.rot$feat,
+                               start = 1,
+                               stop = 10)),
+            size = 4,
             hjust = 0.5) +
   scale_x_continuous(u.axis.labs[1]) +
   scale_y_continuous(u.axis.labs[2]) +
   scale_fill_discrete(name = "Group") +
-  ggtitle("Excess Death (% Predicted) PCA") +
+  ggtitle("Daily Death (% Predicted) PCA") +
   theme_bw() +
   theme(plot.title = element_text(hjust = 0.5,
                                   size = 20))
 
 tiff(filename = "tmp/biplot_excess_dath_pct.tiff",
-     height = 10,
-     width = 10,
+     height = 7,
+     width = 7,
      units = 'in',
      res = 300,
      compression = "lzw+p")
@@ -656,7 +773,7 @@ ggplot(tmp[x < 25],
 ```
 
 ## Classical Seasonal Decomposition by Moving Averages
-```{r}
+```{r,fig.width=6,fig.height=6}
 xx <- ts(data = diab_ca$Rate[diab_ca$set == "trn"],
          frequency = 12)
 
@@ -751,7 +868,7 @@ p1 <- ggplot(diab_ca,
 p1
 ```
 
-```{r}
+```{r,fig.width=7,fig.height=5}
 diab_ca$seas1_pred <- NA
 diab_ca$seas1_pred[1:144] <- rep(diab_ca$seas1[1:12],
                                  rep = 12)
