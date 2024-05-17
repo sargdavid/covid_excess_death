@@ -1,0 +1,667 @@
+---
+title: "COVID Excess Death"
+author: Viguen Poghosyan, Davit Sargsyan
+version: 2.0
+output:
+  html_notebook:
+    highlight: tango
+    toc: true
+    toc_float: true
+    toc_depth: 6
+    number_sections: yes
+    code_folding: hide
+---
+
+Date: `r date()`
+
+Meeting 10/28/22
+Javier:
+1. use "decompose" function (Fourier transform)
+2. find top 3 frequencies (for 12-month frequency)
+3. remove 12-months signal
+4. run 'decompose' again for longer frequency (24 or 36 month?)
+
+# Setup
+```{r setup}
+require(data.table)
+require(ggplot2)
+require(nlme)
+```
+
+# Data
+```{r}
+dt1 <- data.table(read.csv("data/JOINT_HistRec_ETS_Results_short.csv"))
+colnames(dt1)
+
+head(dt1)
+```
+# Data formating
+```{r}
+dt2 <- dt1[, .(Date = as.Date(paste0(dt1$Month_Code,
+                                     "/01"),
+                              format = "%Y/%m/%d"),
+               State = factor(State),
+               Cause = factor(ICD.10.113.Cause.List,
+                              levels = unique(ICD.10.113.Cause.List),
+                              labels = gsub(x = unique(ICD.10.113.Cause.List),
+                                            pattern = "#",
+                                            replacement = "")),
+               Population = dt1$Population,
+               DeathDaily = dt1$Deaths/daysmonth,
+               Rate = 10^5*(dt1$Deaths + 1)/(daysmonth*(Population + 1)))]
+```
+
+```{r}
+levels(dt2$State)
+levels(dt2$Cause)
+```
+# Remove records after 2022-07-01 and all COVID deaths
+```{r}
+# dt2 <- droplevels(dt2[Date < "2022-07-01" &
+#                         Cause != "COVID-19 (U07.1)", ]) 
+dt2 <- droplevels(dt2[Date < "2022-07-01", ]) 
+```
+
+# State populations
+```{r,fig.height=10,fig.width=15}
+tmp <- unique(dt2[, c("Date",
+                      "State",
+                      "Population")])
+
+p1 <- ggplot(tmp,
+             aes(x = Date,
+                 y = Population)) +
+  facet_wrap(~ State,
+             scale = "free_y") +
+  geom_line() +
+  scale_x_continuous(breaks = seq.Date(from = min(tmp$Date),
+                                       to = max(tmp$Date),
+                                       by = 365.25)) +
+  ggtitle("Population") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+
+tiff(filename = "tmp/population.tiff",
+     height = 10,
+     width = 15,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+# Daily death by State
+```{r}
+for (i in 1:nlevels(dt2$Cause)) {
+  p1 <- ggplot(dt2[Cause == levels(dt2$Cause)[i]],
+               aes(x = Date,
+                   y = DeathDaily,
+                   group = Cause)) +
+    facet_wrap(~ State,
+               scale = "free_y") +
+    geom_line() +
+    scale_x_continuous(breaks = seq.Date(from = min(dt2$Date),
+                                         to = max(dt2$Date),
+                                         by = 365.25)) +
+    ggtitle(levels(dt2$Cause)[i]) +
+    theme_bw() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90,
+                                     hjust = 1))
+  
+  tiff(filename = paste0("tmp/",
+                         levels(dt2$Cause)[i],
+                         "_death_daily.tiff"),
+       height = 10,
+       width = 15,
+       units = 'in',
+       res = 300,
+       compression = "lzw+p")
+  print(p1)
+  graphics.off()
+}
+```
+
+# COVID-19 only
+```{r}
+  p1 <- ggplot(dt2[Cause == "COVID-19 (U07.1)" &
+                     Date  >= "2020-03-01", ],
+               aes(x = Date,
+                   y = DeathDaily,
+                   group = Cause)) +
+    facet_wrap(~ State,
+               scale = "free_y") +
+    geom_line() +
+    scale_x_continuous(breaks = seq.Date(from = as.Date("2020-03-01"),
+                                         to = as.Date("2022-07-01"),
+                                         by = 365.25/4)) +
+    ggtitle(levels(dt2$Cause)[i]) +
+    theme_bw() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90,
+                                     hjust = 1))
+  
+  tiff(filename = "tmp/COVID-19 (U07.1)_death_daily.tiff",
+       height = 10,
+       width = 15,
+       units = 'in',
+       res = 300,
+       compression = "lzw+p")
+  print(p1)
+  graphics.off()
+```
+
+# Remove States that never had at least 10 cerebrovascular deaths a day
+```{r}
+tmp <- dt2[Cause == "Cerebrovascular diseases (I60-I69)" ,
+           .(maxDeath = max(DeathDaily)),
+           by = State]
+tmp
+
+ndx_keep <- which(tmp$maxDeath >= 10)
+tmp <- tmp[ndx_keep, ]
+tmp
+```
+
+# Keep these 20 states only
+```{r}
+dt2 <- droplevels(dt2[State %in% tmp$State, ])
+```
+
+# Training/Testing/COVID
+```{r}
+dt2$set <- "trn"
+
+dt2$set[dt2$Date >= "2019-03-01" &
+          dt2$Date < "2020-03-01"] <- "tst"
+
+dt2$set[dt2$Date >= "2020-03-01"] <- "cvd"
+```
+
+# No more zeros - recalculate the rate
+```{r}
+dt2[, Rate := 10^5*DeathDaily/Population]
+```
+
+# Output lists
+```{r}
+betas <- list()
+mape <- list()
+mape_state <- list()
+dtt <- list()
+```
+
+# Modeling
+```{r}
+for (i in 1:nlevels(dt2$Cause)) {
+  # Subset data
+  cod <- levels(dt2$Cause)[i]
+  
+  tmp <- droplevels(dt2[Cause == cod,])
+  
+  tmp$dt <- as.numeric(tmp$Date)
+  tmp$dt_sqr <- tmp$dt^2
+  
+  # LM
+  m1 <- lm(Rate ~ (dt + dt_sqr)*State,
+           data = tmp[set == "trn"])
+  
+  tmp$prd1 <- predict(m1,
+                      newdata = tmp)
+  
+  # Plot
+  p1 <- ggplot(tmp,
+               aes(x = Date,
+                   y = Rate,
+                   group = Cause)) +
+    facet_wrap(~ State) +
+    geom_ribbon(aes(xmin = min(tmp$Date[tmp$set == "tst"]),
+                    xmax = max(tmp$Date[tmp$set == "tst"]),
+                    ymin = -Inf,
+                    ymax = Inf),
+                orientation = "y",
+                fill = "green",
+                alpha = 0.3) +
+    geom_line(color = "gray") +
+    geom_line(aes(x = Date,
+                  y = prd1),
+              color = "red") +
+    scale_x_continuous(breaks = seq.Date(from = min(dt2$Date),
+                                         to = max(dt2$Date),
+                                         by = 365.25)) +
+    ggtitle(cod) +
+    theme_bw() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90,
+                                     hjust = 1))
+  
+  m3 <- try({
+    # NLME
+    m3 <- nlme(Rate ~ b0 + b1*dt + b2*dt^2 + b3*sin(b4 + b5*dt),
+               data = tmp[set == "trn"],
+               random = b0 + b1 + b2 + b3 + b4 + b5 ~ 1 | State,
+               fixed = b0 + b1 + b2 + b3 + b4 + b5 ~ 1,
+               start = list(fixed = c(b0 = m1$coefficients[1], # linear intercept
+                                      b1 = m1$coefficients[2], # linear slope
+                                      b2 = m1$coefficients[3], # square term, i.e. non-linearity of the trend
+                                      b3 = 10000, # wave magnitude
+                                      b4 = 1, # sin shift to the left
+                                      b5 = 0.018))) # wave length(> 1 shortens, < 1 elongates))
+  })
+  if(class(m3)[1] != "try-error") {
+    
+    tmp$prd3 <- predict(m3,
+                        newdata = tmp)
+    
+    dtt[[i]] <- tmp
+    
+    # Save coefficients
+    betas[[i]] <- m3$coefficients$fixed
+    
+    # Save Mean Absolute Percent Error (MAPE)
+    ## All states
+    mape[[i]] <- tmp[, .(mape = 100*mean(abs(Rate - prd3)/(Rate))),
+                     by = set]
+    
+    ## By State
+    mape_state[[i]] <- tmp[, .(mape = 100*mean(abs(Rate - prd3)/(Rate))),
+                           by = list(State,
+                                     set)]
+    # Add predicted curve
+    p1 <- p1 +
+      geom_line(data = tmp,
+                aes(x = Date,
+                    y = prd3),
+                color = "blue")
+  }
+  
+  # Save plot
+  tiff(filename = paste0("tmp/",
+                         cod,
+                         ".tiff"),
+       height = 10,
+       width = 10,
+       units = 'in',
+       res = 300,
+       compression = "lzw+p")
+  print(p1)
+  graphics.off()
+}
+```
+
+# Table 1: Betas
+```{r}
+betas_t <- copy(betas)
+names(betas_t) <- levels(dt2$Cause)
+
+ndx <- lapply(X = betas_t,
+              FUN = is.null)
+ndx
+
+# betas$`Malignant neoplasms (C00-C97)` <- NULL
+
+t1 <- do.call("rbind",
+              betas_t)
+
+t1
+
+write.csv(t1,
+          file = "tmp/betas.csv",
+          row.names = TRUE)
+```
+
+# Table 2: MAPE, all states
+```{r}
+mape_t <- copy(mape)
+
+names(mape) <- levels(dt2$Cause)
+# mape$`Malignant neoplasms (C00-C97)` <- NULL
+
+t2 <- rbindlist(mape,
+                use.names = TRUE)
+t2 <- data.table(`Cause of Death` = rep(names(mape),
+                                        each = 3),
+                 t2)
+t2$set <- factor(t2$set,
+                 levels = c("trn",
+                            "tst",
+                            "cvd"),
+                 labels = c("Training",
+                            "Testing",
+                            "COVID-19"))
+
+t2 <- dcast.data.table(t2,
+                       `Cause of Death` ~ set,
+                       value.var = "mape")
+
+t2
+
+write.csv(t2,
+          file = "tmp/mape.csv",
+          row.names = FALSE)
+```
+
+# Table 3: MAPE, by State
+```{r}
+out <- list()
+for (i in 1:length(mape_state)) {
+  out[[i]] <- data.table(`Cause of Death` = levels(dt2$Cause)[i],
+                         mape_state[[i]])
+}
+
+names(out) <- levels(dt2$Cause)
+
+out$`COVID-19 (U07.1)` <- NULL
+out$`Diseases of heart (I00-I09,I11,I13,I20-I51)` <- NULL
+out$Other_rev <- NULL
+
+t3 <- rbindlist(out)
+
+t3$set <- factor(t3$set,
+                 levels = c("trn",
+                            "tst",
+                            "cvd"),
+                 labels = c("Training",
+                            "Testing",
+                            "COVID-19"))
+
+t3 <- dcast.data.table(t3,
+                       `Cause of Death` + State ~ set,
+                       value.var = "mape")
+
+head(t3)
+
+write.csv(t3,
+          file = "tmp/mape_state.csv",
+          row.names = FALSE)
+```
+
+# Save data
+```{r}
+dt3 <- rbindlist(dtt)
+save(dt3,
+     file = "tmp/td3.RData")
+```
+
+# Custom plots
+```{r,fig.width=6,fig.height=4}
+diab_ca <- dt3[Cause == "Diabetes mellitus (E10-E14)" &
+             State == "California"]
+
+p1 <- ggplot(diab_ca,
+             aes(x = Date,
+                 y = Rate,
+                 group = Cause)) +
+  geom_ribbon(aes(xmin = min(diab_ca$Date[diab_ca$set == "tst"]),
+                  xmax = max(diab_ca$Date[diab_ca$set == "tst"])),
+              orientation = "y",
+              fill = "green",
+              alpha = 0.3) +
+  geom_line(color = "gray") +
+  geom_line(aes(x = Date,
+                y = prd1),
+            color = "red") +
+  scale_x_continuous(breaks = seq.Date(from = min(diab_ca$Date),
+                                       to = max(diab_ca$Date),
+                                       by = 365.25)) +
+  ggtitle(paste(diab_ca$Cause[1],
+                diab_ca$State[1],
+                sep = ": ")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1)) +
+  geom_line(data = diab_ca,
+            aes(x = Date,
+                y = prd3),
+            color = "blue")
+p1
+```
+
+# Fast Fourier Transform
+## Spectral density of a time serie
+Fourier transform decomposes functions into frequency components. Highest peak represents the largest frequency. In this case, 1/12, i.e., 12-month repeated periods.  
+
+```{r}
+# x <- 1:4
+# fft(x)
+# xx <- fft(fft(x), inverse = TRUE)/length(x)
+# 
+# xx <- fft(z = diab_ca$Rate[diab_ca$set == "trn"])
+# xx
+```
+
+```{r}
+xx <- spectrum(diab_ca$Rate[diab_ca$set == "trn"])
+
+# The highest peak is around the 12-months cycle
+abline(v = 1/12, 
+       col = 2, # red
+       lty = 2,
+       lw = 2)
+
+# Other top peaks
+abline(v = 1/60,
+       col = 3, # blue
+       lty = 2)
+abline(v = 1/6, 
+       col = 4, # green
+       lty = 2)
+
+tmp <- data.table(x = 1/xx$freq,
+                  y = xx$spec)
+ggplot(tmp[x < 25],
+       aes(x = x,
+           y = y)) +
+  geom_line() +
+  scale_x_continuous("Months",
+                     breaks = seq(from = 0, 
+                                  to = 200,
+                                  by = 6)) +
+  scale_y_continuous("Spectral Density") +
+  geom_vline(xintercept = c(6, 12),
+             color = "red",
+             linetype = "dashed") +
+  theme_bw()
+```
+
+# Classical Seasonal Decomposition by Moving Averages
+```{r}
+xx <- ts(data = diab_ca$Rate[diab_ca$set == "trn"],
+         frequency = 12)
+
+m11 <- decompose(xx)
+summary(m11)
+plot(m11)
+```
+
+## Plot seasonal effect and trend
+```{r}
+diab_ca$seas1 <- diab_ca$trend1 <- NA
+diab_ca$seas1[diab_ca$set == "trn"] <- c(m11$seasonal)
+diab_ca$trend1[diab_ca$set == "trn"] <- c(m11$trend)
+diab_ca[, freq1 := seas1 + trend1]
+
+p1 <- ggplot(diab_ca,
+             aes(x = Date,
+                 y = Rate,
+                 group = Cause)) +
+  geom_ribbon(aes(xmin = min(diab_ca$Date[diab_ca$set == "tst"]),
+                  xmax = max(diab_ca$Date[diab_ca$set == "tst"])),
+              orientation = "y",
+              fill = "green",
+              alpha = 0.3) +
+  geom_line(color = "gray") +
+  geom_line(aes(x = Date,
+                y = trend1),
+            color = "blue") +
+  geom_line(aes(x = Date,
+                y = freq1),
+            color = "red") +
+  scale_x_continuous(breaks = seq.Date(from = min(diab_ca$Date),
+                                       to = max(diab_ca$Date),
+                                       by = 365.25)) +
+  ggtitle(paste(diab_ca$Cause[1],
+                diab_ca$State[1],
+                sep = ": ")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+p1
+```
+
+```{r}
+diab_ca$dt <- as.numeric(factor(diab_ca$Date))
+diab_ca$dt2 <- diab_ca$dt^2
+
+tm1 <- lm(trend1 ~ dt + dt2,
+          data = diab_ca[set == "trn", ])
+tm1
+
+diab_ca$trend1_pred <- predict(tm1,
+                               newdata = list(dt = diab_ca$dt,
+                                              dt2 = diab_ca$dt2))
+diab_ca[set == "trn",
+        freq2 := seas1 + trend1_pred]
+
+plot(trend1_pred ~ dt,
+     data = diab_ca,
+     type = "l")
+lines(trend1 ~ dt,
+     data = diab_ca,
+     col = 2)
+
+p1 <- ggplot(diab_ca,
+             aes(x = Date,
+                 y = Rate,
+                 group = Cause)) +
+  geom_ribbon(aes(xmin = min(diab_ca$Date[diab_ca$set == "tst"]),
+                  xmax = max(diab_ca$Date[diab_ca$set == "tst"])),
+              orientation = "y",
+              fill = "green",
+              alpha = 0.3) +
+  geom_line(color = "gray") +
+  geom_line(aes(x = Date,
+                y = trend1_pred),
+            color = "blue") +
+  geom_line(aes(x = Date,
+                y = freq2),
+            color = "red") +
+  scale_x_continuous(breaks = seq.Date(from = min(diab_ca$Date),
+                                       to = max(diab_ca$Date),
+                                       by = 365.25)) +
+  ggtitle(paste(diab_ca$Cause[1],
+                diab_ca$State[1],
+                sep = ": ")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+p1
+```
+
+```{r}
+diab_ca$seas1_pred <- NA
+diab_ca$seas1_pred[1:144] <- rep(diab_ca$seas1[1:12],
+                                 rep = 12)
+diab_ca$seas1_pred[145:150] <- diab_ca$seas1[1:6]
+
+diab_ca[, freq3 := seas1_pred + trend1_pred]
+
+p1 <- ggplot(diab_ca,
+             aes(x = Date,
+                 y = Rate,
+                 group = Cause)) +
+  geom_ribbon(aes(xmin = min(diab_ca$Date[diab_ca$set == "tst"]),
+                  xmax = max(diab_ca$Date[diab_ca$set == "tst"])),
+              orientation = "y",
+              fill = "green",
+              alpha = 0.3) +
+  geom_line(color = "gray") +
+  geom_line(aes(x = Date,
+                y = trend1_pred),
+            color = "blue") +
+  geom_line(aes(x = Date,
+                y = freq3),
+            color = "red") +
+  scale_x_continuous(breaks = seq.Date(from = min(diab_ca$Date),
+                                       to = max(diab_ca$Date),
+                                       by = 365.25)) +
+  ggtitle(paste(diab_ca$Cause[1],
+                diab_ca$State[1],
+                sep = ": ")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+diab_ca[set == "trn",
+        freq2 := seas1 + trend1_pred]
+p1
+```
+## MAPE
+```{r}
+    mape_state[[i]] <- tmp[, .(mape = 100*mean(abs(Rate - prd3)/(Rate))),
+                           by = list(State,
+                                     set)]
+
+diab_ca[, .(mape = 100*mean(abs(Rate - freq3)/Rate)),
+        by = set]
+```
+
+
+## Subtract seasonal effect (12-month cycle)
+```{r}
+# diab_ca$Rate2 <- diab_ca$Rate - c(m11$seasonal)
+diab_ca[, Rate2 := Rate - seas1 - trend1_pred]
+```
+
+## Rerun spectral analysis
+```{r}
+xx <- spectrum(diab_ca$Rate2[diab_ca$set == "trn"])
+
+tmp <- data.table(x = 1/xx$freq,
+                  y = xx$spec)
+ggplot(tmp[x < 25],
+       aes(x = x,
+           y = y)) +
+  geom_line() +
+  scale_x_continuous("Months",
+                     breaks = seq(from = 0, 
+                                  to = 200,
+                                  by = 6)) +
+  scale_y_continuous("Spectral Density") +
+  geom_vline(xintercept = c(13.3),
+             color = "red",
+             linetype = "dashed") +
+  theme_bw()
+```
+
+
+```{r}
+xx <- ts(data = diab_ca$Rate2[diab_ca$set == "trn"],
+         frequency = 50)
+
+m12 <- decompose(xx)
+summary(m12)
+plot(m12)
+```
+
+In this case, 1/12 frequency seems to be the only one. 
+Extend this to the training and validation sets, and calculate MAPE.  
+
+**ToDo:**  
+1. Calculate MAPE for all 3 sets.  
+2. Repeat this for each of the 20 states and for each cause of death.  
+3. How to make this analysis for all 20 states in a single model (similar to random effects model idea)?  
+4. Use new data from Nuria (US-wide, not separated by states).  
+  
+# Session
+```{r}
+sessionInfo()
+```

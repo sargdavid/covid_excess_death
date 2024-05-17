@@ -1,0 +1,455 @@
+---
+title: "COVID Excess Death"
+format: html
+editor: source
+highlight-style: tango
+toc: true
+toc-float: true
+toc-depth: 6
+number-sections: true
+code-fold: true
+self-contained: true
+---
+
+# Setup
+
+Script Date: 11/2/2023\
+Last Updated: `r date()`
+
+#### Meeting 3/28/2024
+
+Training: 1/1/2026 to 1/31/2019
+
+Forecast: 2/1/2019 to 1/31/2020
+
+Back to normal: 2/1/2020 to the end
+
+#### Meeting 10/28/2022
+
+Javier: 1. use "decompose" function (Fourier transform) 2. find top 3 frequencies (for 12-month frequency) 3. remove 12-months signal 4. run 'decompose' again for longer frequency (24 or 36 month?)\
+2. Repeat seasonality analysis for each of the 20 states and for each cause of death.\
+3. How to make this analysis for all 20 states in a single model (similar to random effects model idea)?\
+4. Use new data from Nuria (US-wide, not separated by states).\
+5. F-Test residuals from the 12month and 13 month (seasonality of residuals). Other ways to compare? bootstrap?\
+6. Try to get daily temperatures. What part of months are the peaks - beginning, middle or end? are the peaks between 2 months?\
+7. Using lockdown, mask and vaccination data, model residuals of the forecast (COVID years). Might be lag. Talk to Yajie.\
+8. Weighted PCA? Talk to Yajie.\
+9. For PCA, transform log(1+ a%) - log(1 - b%). Use DMR::trans2 function.
+
+```{r}
+# install.packages("C:/git_local/DNAMR_1.2.tar.gz",
+#                  repos = NULL,
+#                  type = "source")
+## NOTE: needs dependencies: moments
+
+require(data.table)
+require(ggplot2)
+require(nlme)
+
+# require(DNAMR)
+```
+
+# Data
+
+## Load October 2023 Data
+
+```{r}
+dt1 <- data.table(read.csv("../data/Excess Death Month_cause_State_ ETS Forecast_2023_09_TO_SEND.csv"))
+
+dt1 <- dt1[Use_unduplicated == "YES",]
+dt1$ICD.10.113.Cause.List[dt1$ICD.10.113.Cause.List == "#Intentional self-harm (suicide) (*U03,X60-X84,Y87.0)"] <- "#Intentional self-harm (suicide) (U03,X60-X84,Y87.0)" 
+```
+
+## Format variables
+
+```{r}
+dt2 <- dt1[, .(State = State,
+               # State = factor(State),
+               Year = as.integer(substr(x = Year,
+                                        start = 1,
+                                        stop = 4)),
+               Month = as.integer(substr(x = Month.Code,
+                                         start = 6,
+                                         stop = 7)),
+               Date = as.Date(paste0(Month.Code,
+                                     "/01"),
+                              format = "%Y/%m/%d"), 
+               DaysMonth = as.integer(daysmonth),
+               Population = as.integer(Population),
+               Cause= factor(gsub(pattern = "#",
+                                  x = ICD.10.113.Cause.List,
+                                  replacement = "")),
+               # Cause = factor(ICD.10.113.Cause.List),
+               Deaths = as.integer(Deaths))]
+
+# Keep data starting 1/1/2006
+dt2 <- droplevels(dt2[Date >= "2006-01-01" & 
+                        Date < "2023-8-01" &
+                        Cause != "ALL causes", ])
+
+dt2[, Population_dPct := 100*(Population - 
+                                Population[Year == 2006][1])/
+      Population[Year == 2006][1],
+    by = list(State)]
+
+dt2[, DeathDaily := Deaths/dt2$DaysMonth]
+dt2[, Rate := 10^5*DeathDaily/Population]
+
+summary(dt2)
+
+unique(dt2$State)
+unique(dt2$Cause)
+```
+
+## Plot population by State
+
+```{r,fig.height=10,fig.width=18}
+tmp <- droplevels(unique(dt2[, c("State",
+                                 "Year",
+                                 "Population",
+                                 "Population_dPct")]))
+
+p1 <- ggplot(tmp,
+             aes(x = Year,
+                 y = Population)) +
+  facet_wrap(~ State,
+             scale = "free_y") +
+  geom_line() +
+  scale_x_continuous(breaks = seq(from = 2005,
+                                  to = 2023,
+                                  by = 2)) +
+  ggtitle("Population") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 2))
+
+tiff(filename = "../tmp/population.tiff",
+     height = 10,
+     width = 18,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+## Plot population % change from 2006 by State
+
+```{r,fig.height=10,fig.width=18}
+p1 <- ggplot(tmp,
+             aes(x = Year,
+                 y = Population_dPct)) +
+  facet_wrap(~ State) +
+  geom_line() +
+  scale_x_continuous("Population (% cahnge from 2006)",
+                     breaks = seq(from = 2005,
+                                  to = 2023,
+                                  by = 2)) +
+  ggtitle("Population % Change from 2006") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 2))
+
+tiff(filename = "../tmp/population_dpct.tiff",
+     height = 10,
+     width = 18,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+## Daily death by State
+
+```{r}
+for (i in 1:nlevels(dt2$Cause)) {
+  p1 <- ggplot(dt2[Cause == levels(dt2$Cause)[i]],
+               aes(x = Date,
+                   y = Rate, # DeathDaily,
+                   group = Cause)) +
+    facet_wrap(~ State,
+               scale = "free_y") +
+    geom_line() +
+    scale_x_continuous(breaks = seq.Date(from = min(dt2$Date),
+                                         to = max(dt2$Date),
+                                         by = 365.25)) +
+    ggtitle(levels(dt2$Cause)[i]) +
+    theme_bw() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90,
+                                     hjust = 1))
+  
+  tiff(filename = paste0("../tmp/",
+                         levels(dt2$Cause)[i],
+                         "_death_daily.tiff"),
+       height = 10,
+       width = 15,
+       units = 'in',
+       res = 300,
+       compression = "lzw+p")
+  print(p1)
+  graphics.off()
+}
+```
+
+## Training/Testing/COVID/post-COVID
+
+```{r}
+dt2$set <- "trn"
+
+dt2$set[dt2$Date >= "2019-03-01" &
+          dt2$Date < "2020-03-01"] <- "tst"
+
+dt2$set[dt2$Date >= "2020-03-01" &
+          dt2$Date < "2022-06-01"] <- "cvd"
+
+dt2$set[dt2$Date >= "2022-06-01"] <- "post_cvd"
+```
+
+## Example: diabetes death in CA
+
+```{r}
+dt_ca_db <- droplevels(dt2[Cause == "Diabetes mellitus (E10-E14)" & 
+                             State == "California",])
+```
+
+```{r}
+p1 <- ggplot(dt_ca_db,
+             aes(x = Date,
+                 y = Rate, # DeathDaily,
+                 group = Cause)) +
+  facet_wrap(~ State,
+             scale = "free_y") +
+  geom_line() +
+  geom_vline(xintercept = as.Date(c("2019-03-01",
+                            "2020-03-01",
+                            "2022-06-01")),
+             color = "red",
+             linetype = "dashed") +
+  scale_x_continuous(breaks = seq.Date(from = min(dt2$Date),
+                                       to = max(dt2$Date),
+                                       by = 365.25)) +
+  ggtitle("ALL causes") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+p1
+```
+
+### LM
+
+```{r}
+dt_ca_db$dt <- as.numeric(dt_ca_db$Date)
+dt_ca_db$dt_sqr <- dt_ca_db$dt^2
+
+m1 <- lm(Rate ~ dt + dt_sqr,
+         data = dt_ca_db[set == "trn",])
+
+dt_ca_db$prd1 <- predict(m1,
+                         newdata = dt_ca_db)
+```
+
+### Plot LM
+
+```{r}
+p1 <- ggplot(dt_ca_db,
+             aes(x = Date,
+                 y = Rate,
+                 group = State)) +
+  facet_wrap(~ State,
+             scale = "free_y") +
+  geom_vline(xintercept = as.Date(c("2019-03-01",
+                                    "2020-03-01",
+                                    "2022-06-01")),
+             color = "red",
+             linetype = "dashed") +
+  # geom_ribbon(aes(xmin = min(dt2$Date[dt2$set == "tst"]),
+  #                 xmax = max(dt2$Date[dt2$set == "tst"]),
+  #                 ymin = -Inf,
+  #                 ymax = Inf),
+  #             orientation = "y",
+  #             fill = "green",
+  #             alpha = 0.3) +
+  geom_line(color = "gray") +
+  geom_line(aes(x = Date,
+                y = prd1),
+            color = "red") +
+  scale_x_continuous(breaks = seq.Date(from = min(dt_ca_db$Date),
+                                       to = max(dt_ca_db$Date),
+                                       by = 365.25)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+p1
+```
+
+### NLS
+
+```{r}
+# m2 <- nls(Rate ~ b0 + b1*dt + b2*dt^2 + b3*sin(b4 + b5*dt),
+#            data = dt_ca_db[set == "trn", ],
+#            start = list(fixed = c(b0 = 2.5, # linear intercept
+#                                   b1 = 1, # linear slope
+#                                   b2 = 1, # square term, i.e. non-linearity of the trend
+#                                   b3 = 10000, # wave magnitude
+#                                   b4 = 1, # sin shift to the left
+#                                   b5 = 0.018)),# wave length(> 1 shortens, < 1 elongates)
+#            control = nlmeControl(maxIter = 500)) 
+
+m2 <- nls(Rate ~ b0 + b1*dt + b2*dt^2 + b3*sin(b4 + b5*dt),
+          data = dt_ca_db[set == "trn", ],
+          start = list(b0 = m1$coefficients[1],
+                       b1 = m1$coefficients[2],
+                       b2 = 0, # m1$coefficients[3],
+                       b3 = 10000,
+                       b4 = 1,
+                       b5 = 1/60))
+```
+
+```{r}
+dt_ca_db$prd2 <- predict(m2,
+                         newdata = dt_ca_db)
+
+# Save coefficients
+betas <- m2$coefficients$fixed
+
+# Save Mean Absolute Percent Error (MAPE)
+## All states
+mape <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
+                 by = set]
+
+## By State
+mape_state <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
+                       by = list(State,
+                                 set)]
+```
+
+### Plot NLS
+
+```{r}
+p1 <- ggplot(dt_ca_db,
+             aes(x = Date,
+                 y = Rate,
+                 group = Cause)) +
+  geom_ribbon(aes(xmin = min(dt_ca_db$Date[dt_ca_db$set == "tst"]),
+                  xmax = max(dt_ca_db$Date[dt_ca_db$set == "tst"])),
+              orientation = "y",
+              fill = "green",
+              alpha = 0.3) +
+  geom_ribbon(aes(xmin = min(dt_ca_db$Date[dt_ca_db$set == "cvd"]),
+                  xmax = max(dt_ca_db$Date[dt_ca_db$set == "cvd"])),
+              orientation = "y",
+              fill = "red",
+              alpha = 0.3) +
+  geom_line(color = "black",
+            alpha = 0.7) +
+  geom_line(aes(x = Date,
+                y = prd1), # prediction from lm
+            color = "black",
+            linetype = "dashed") +
+  geom_line(data = dt_ca_db,
+            aes(x = Date,
+                y = prd2), # prediction from nls
+            color = "blue") +
+  scale_x_continuous(breaks = seq.Date(from = min(dt_ca_db$Date),
+                                       to = max(dt_ca_db$Date),
+                                       by = 365.25)) +
+  ggtitle("All-cause death in CA") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+
+p1
+```
+
+### Seasonality
+
+```{r}
+xx <- spectrum(dt_ca_db$Rate[dt_ca_db$set == "trn"])
+
+# The highest peak is around the 12-months cycle
+abline(v = 1/12, 
+       col = 2, # red
+       lty = 2,
+       lw = 2)
+
+# Other top peaks
+abline(v = 1/60,
+       col = 3, # blue
+       lty = 2)
+abline(v = 1/6, 
+       col = 4, # green
+       lty = 2)
+
+tmp <- data.table(x = 1/xx$freq,
+                  y = xx$spec)
+ggplot(tmp[x < 25],
+       aes(x = x,
+           y = y)) +
+  geom_line() +
+  scale_x_continuous("Months",
+                     breaks = seq(from = 0, 
+                                  to = 200,
+                                  by = 6)) +
+  scale_y_continuous("Spectral Density") +
+  geom_vline(xintercept = c(6, 12),
+             color = "red",
+             linetype = "dashed") +
+  theme_bw()
+```
+
+#### Classical Seasonal Decomposition by Moving Averages
+
+```{r,fig.width=6,fig.height=6}
+xx <- ts(data = dt_ca_db$Rate[dt_ca_db$set == "trn"],
+         frequency = 12)
+
+m11 <- decompose(xx)
+summary(m11)
+plot(m11)
+```
+
+#### Plot seasonal effect and trend
+
+```{r}
+dt_ca_db$seas1 <- dt_ca_db$trend1 <- NA
+dt_ca_db$seas1[dt_ca_db$set == "trn"] <- c(m11$seasonal)
+dt_ca_db$trend1[dt_ca_db$set == "trn"] <- c(m11$trend)
+dt_ca_db[, freq1 := seas1 + trend1]
+
+p1 <- ggplot(dt_ca_db,
+             aes(x = Date,
+                 y = Rate,
+                 group = Cause)) +
+  geom_ribbon(aes(xmin = min(dt_ca_db$Date[dt_ca_db$set == "tst"]),
+                  xmax = max(dt_ca_db$Date[dt_ca_db$set == "tst"])),
+              orientation = "y",
+              fill = "green",
+              alpha = 0.3) +
+  geom_line(color = "gray") +
+  geom_line(aes(x = Date,
+                y = trend1),
+            color = "blue") +
+  geom_line(aes(x = Date,
+                y = freq1),
+            color = "red") +
+  scale_x_continuous(breaks = seq.Date(from = min(dt_ca_db$Date),
+                                       to = max(dt_ca_db$Date),
+                                       by = 365.25)) +
+  ggtitle("All-cause death in CA") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+p1
+```

@@ -1,0 +1,93 @@
+---
+title: "COVID-19 Exces Death Dataset Comparison"
+output: html_notebook
+---
+
+# Setup
+```{r setup}
+require(data.table)
+require(ggplot2)
+```
+
+# Data
+## Old Data
+```{r}
+dt0 <- data.table(read.csv("data/JOINT_HistRec_ETS_Results_short.csv"))
+names(dt0)
+```
+
+### Format variables
+```{r}
+dt01 <- dt0[, .(State = State,
+                #State = factor(State),
+                Year = as.numeric(substr(x = Year,
+                                         start = 1,
+                                         stop = 4)),
+                Month = Month,
+                Date = as.Date(paste0(Month_Code,
+                                      "/01"),
+                               format = "%Y/%m/%d"), 
+                DaysMonth = as.integer(daysmonth),
+                Population = as.numeric(dt0$Population),
+                # Cause = factor(gsub(pattern = "#",
+                #                     x = ICD.10.113.Cause.List,
+                #                     replacement = "")),
+                Cause = ICD.10.113.Cause.List,
+Deaths = as.integer(Deaths))]
+summary(dt01)
+```
+
+## New Data, Oct 2023
+```{r}
+dt1 <- data.table(read.csv("data/2023_09Update_Monthly_State_cause_Provisional Mortality Statistics, 2018 through Last Week.csv"))
+```
+
+### Format variables
+```{r}
+dt2 <- dt1[, .(State = State,
+               # State = factor(State),
+               Year = as.numeric(substr(x = Year,
+                                        start = 1,
+                                        stop = 4)),
+               Month = as.numeric(substr(x = Month.Code,
+                                         start = 6,
+                                         stop = 7)),
+               Date = as.Date(paste0(Month.Code,
+                                     "/01"),
+                              format = "%Y/%m/%d"), 
+               DaysMonth = as.integer(daysmonth),
+               Population = as.numeric(Population.1),
+               # Cause = factor(gsub(pattern = "#",
+               #                     x = ICD.10.113.Cause.List,
+               #                     replacement = "")),
+               Cause = ICD.10.113.Cause.List,
+               Deaths = as.integer(Deaths))]
+summary(dt2)
+```
+
+## Merge data
+```{r}
+dt3 <- merge(dt01,
+             dt2,
+             by = c("State",
+                    "Date",
+                    "Cause"))
+```
+
+# Compare
+```{r,fig.height=8,fig.width=8}
+ggplot(dt3[Year.x %in% 20018:2019 &
+             State == "New York",],
+       aes(x = Deaths.x,
+           y = Deaths.y,
+           fill = Cause)) +
+  facet_wrap(~ Cause,
+             scale = "free") +
+  geom_point(shape = 21,
+             size = 2) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              linetype = "dashed") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
