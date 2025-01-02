@@ -1,0 +1,644 @@
+---
+title: "COVID Excess Death"
+format: html
+editor: source
+highlight-style: tango
+toc: true
+toc-float: true
+toc-depth: 6
+number-sections: true
+code-fold: true
+self-contained: true
+---
+
+# Setup
+
+Script Date: 11/2/2023
+Last Updated: 1/2/2025
+
+# Data Subsets
+
+Training: 1/1/2015 to 2/1/2019  
+Hold-out: 3/1/2019 to 2/1/2020  
+Best model rerun:  1/1/2015 to 2/1/2020
+Back to normal: 3/1/2020 to 9/1/2023
+
+# SUBMIT TO (Michael and Javier, 10/18/24):
+
+1. Annals of Operational Reseach
+2. IEEE
+
+#### Meeting 6/7/2024 
+
+Dhammika:  
+a. Use Median Absolute Error instead of MAPE.    
+b. Use cubic spline to better model trend in the seasonality model prediction .   
+
+Davit: noticed that the sinusoidal model underestimates trend in post-COVID data. Fix this!   
+
+#### Meeting 10/28/2022
+
+Javier: 1. use "decompose" function (Fourier transform) 2. find top 3 frequencies (for 12-month frequency) 3. remove 12-months signal 4. run 'decompose' again for longer frequency (24 or 36 month?)\
+2. Repeat seasonality analysis for each of the 20 states and for each cause of death.\
+3. How to make this analysis for all 20 states in a single model (similar to random effects model idea)?\
+4. Use new data from Nuria (US-wide, not separated by states).\
+5. F-Test residuals from the 12month and 13 month (seasonality of residuals). Other ways to compare? bootstrap?\
+6. Try to get daily temperatures. What part of months are the peaks - beginning, middle or end? are the peaks between 2 months?\
+7. Using lockdown, mask and vaccination data, model residuals of the forecast (COVID years). Might be lag. Talk to Yajie.\
+8. Weighted PCA? Talk to Yajie.\
+9. For PCA, transform log(1+ a%) - log(1 - b%). Use DMR::trans2 function.
+
+```{r}
+# install.packages("C:/git_local/DNAMR_1.2.tar.gz",
+#                  repos = NULL,
+#                  type = "source")
+## NOTE: needs dependencies: moments
+
+require(data.table)
+require(ggplot2)
+require(nlme)
+
+# require(DNAMR)
+```
+
+# Data
+
+## Load October 2023 Data
+
+```{r}
+dt1 <- data.table(read.csv("../data/Excess Death Month_cause_State_ ETS Forecast_2023_11_AddUS_TO_SEND.csv"))
+
+dt1 <- dt1[Use_unduplicated == "YES",] # All records are unduplicated in this data
+dt1$ICD.10.113.Cause.List[dt1$ICD.10.113.Cause.List == "#Intentional self-harm (suicide) (*U03,X60-X84,Y87.0)"] <- "#Intentional self-harm (suicide) (U03,X60-X84,Y87.0)" 
+```
+
+# CHECKPOINT
+
+```{r}
+dt1[is.na(Population), ]
+```
+Nothing is missing
+
+CA only  
+```{r}
+tmp <- dt1[State == "California" & Year.Code == 2018, ]
+class(tmp$Population)
+
+head(as.integer(tmp$Population))
+
+head(dt1$Population)
+```
+
+
+## Format variables
+
+```{r}
+dt2 <- dt1[, .(State = State,
+               Year = as.integer(Year.Code),
+               Month = as.integer(substr(x = Month,
+                                         start = 6,
+                                         stop = 7)),
+               Date = as.Date(Month,
+                              format = "%m/%d/%Y"), 
+               DaysMonth = as.integer(daysmonth),
+               Population = as.integer(Population),
+               Cause= factor(gsub(pattern = "#",
+                                  x = ICD.10.113.Cause.List,
+                                  replacement = "")),
+               Deaths = as.integer(Deaths),
+               Training1 = dt1$Training1,
+               Testing1 = dt1$Testing1,
+               Training2 = dt1$Training2,
+               Testing2 = dt1$Testing2)]
+
+range(dt2$Date)
+
+# To match Nuria's analysis, remove data prior to 1/1/2015
+dt2 <- droplevels(dt2[Date >= "2015-01-01" & 
+                        Date < "2023-10-01" &
+                        Cause != "ALL causes", ])
+range(dt2$Date)
+
+range(dt2$Date[dt2$Training1 == "YES"])
+range(dt2$Date[dt2$Testing1 == "YES"])
+range(dt2$Date[dt2$Training2 == "YES"])
+range(dt2$Date[dt2$Testing2 == "YES"])
+
+dt2[, Population_dPct := 100*(Population - 
+                                Population[Year == 2015][1])/
+      Population[Year == 2015][1],
+    by = list(State)]
+
+dt2[, DeathDaily := Deaths/DaysMonth]
+dt2[, Rate := 10^5*DeathDaily/Population]
+
+summary(dt2)
+
+unique(dt2$State)
+
+dt2$Cause <- factor(dt2$Cause,
+                    levels = c("COVID-19 (U07.1)",
+                               "Influenza and pneumonia (J09-J18)",
+                               "Chronic lower respiratory diseases (J40-J47)",
+                               "Cerebrovascular diseases (I60-I69)",
+                               "Diseases of heart (I00-I09,I11,I13,I20-I51)",
+                               "Essential hypertension and hypertensive renal disease (I10,I12,I15)",
+                               "Malignant neoplasms (C00-C97)",
+                               "Nephritis, nephrotic syndrome and nephrosis (N00-N07,N17-N19,N25-N27)",
+                               "Diabetes mellitus (E10-E14)",
+                               "Chronic liver disease and cirrhosis (K70,K73-K74)" ,
+                               "Alzheimer disease (G30)",
+                               "Parkinson disease (G20-G21)",
+                               "Septicemia (A40-A41)",
+                               "Intentional self-harm (suicide) (U03,X60-X84,Y87.0)",
+                               "Accidents (unintentional injuries) (V01-X59,Y85-Y86)",
+                               "Not top 15"),
+                    labels = c("COVID-19",
+                               "Influenza and pneumonia",
+                               "Lungs",
+                               "CVD",
+                               "Heart",
+                               "Hypertension",
+                               "Cancer",
+                               "Kidney",
+                               "Diabetes",
+                               "Liver",
+                               "Alzheimer",
+                               "Parkinson",
+                               "Septicemia",
+                               "Suicide",
+                               "Accidents",
+                               "Other"))
+
+levels(dt2$Cause)
+```
+
+```{r}
+range(dt2$Date[dt2$Training1 == "YES"])
+
+range(dt2$Date[dt2$Training2 == "YES"])
+
+range(dt2$Date[dt2$Testing1 == "YES"])
+range(dt2$Date[dt2$Testing2 == "YES"])
+
+dt2$set <- "none"
+
+dt2$set[dt2$Training1 == "YES"] <- "trn1"
+
+dt2$set[dt2$Testing1 == "YES"] <- "tst1"
+
+dt2$set[dt2$Date >= "2020-03-01" &
+          dt2$Date < "2022-06-01"] <- "cvd"
+
+dt2$set[dt2$Date >= "2022-06-01"] <- "post_cvd"
+
+range(dt2$Date[dt2$set == "none"])
+range(dt2$Date[dt2$set == "trn1"])
+range(dt2$Date[dt2$set == "tst1"])
+range(dt2$Date[dt2$set == "cvd"])
+range(dt2$Date[dt2$set == "post_cvd"])
+```
+
+## Split states from whole US
+
+```{r}
+dtus <- droplevels(dt2[State == "US", ])
+
+dt2 <- droplevels(dt2[State != "US", ])
+```
+
+## US population
+
+```{r}
+tmp <- unique(dtus[, c("Year",
+                       "Population",
+                       "Population_dPct")])
+```
+
+
+```{r,fig.height=4,fig.width=6}
+p1 <- ggplot(tmp,
+             aes(x = Year,
+                 y = Population/10^6)) +
+  geom_line() +
+  geom_point(shape = 21,
+             size = 2,
+             fill = "green") +
+  scale_x_continuous(breaks = seq(from = 2015,
+                                  to = 2023,
+                                  by = 1)) +
+  scale_y_continuous("Population [million]",
+                     breaks = 320:335) +
+  ggtitle("US Population") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 2))
+
+tiff(filename = "../tmp/us_population.tiff",
+     height = 4,
+     width = 6,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+### % change
+
+```{r,fig.height=4,fig.width=6}
+p1 <- ggplot(tmp,
+             aes(x = Year,
+                 y = Population_dPct)) +
+  geom_line() +
+  geom_point(shape = 21,
+             size = 2,
+             fill = "green") +
+  scale_x_continuous(breaks = seq(from = 2015,
+                                  to = 2023,
+                                  by = 1)) +
+  scale_y_continuous("Population [% January 2015]") +
+  ggtitle("US Population % Change from January 2015") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 2))
+
+tiff(filename = "../tmp/us_population_dpct.tiff",
+     height = 4,
+     width = 6,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+
+## States population
+
+```{r}
+tmp <- droplevels(unique(dt2[, c("State",
+                                 "Year",
+                                 "Population",
+                                 "Population_dPct")]))
+```
+
+
+```{r,fig.height=10,fig.width=18}
+p1 <- ggplot(tmp,
+             aes(x = Year,
+                 y = Population/10^6)) +
+  facet_wrap(~ State,
+             scale = "free_y") +
+  geom_line() +
+  geom_point(shape = 21,
+             size = 2,
+             fill = "green") +
+  scale_x_continuous(breaks = seq(from = 2015,
+                                  to = 2023,
+                                  by = 1)) +
+  scale_y_continuous("Population [million]") +
+  ggtitle("State Population") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 2))
+
+tiff(filename = "../tmp/state_population.tiff",
+     height = 10,
+     width = 18,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+### % change
+
+```{r,fig.height=10,fig.width=18}
+p1 <- ggplot(tmp,
+             aes(x = Year,
+                 y = Population_dPct)) +
+  facet_wrap(~ State,
+             scale = "free_y") +
+  geom_line() +
+  geom_point(shape = 21,
+             size = 2,
+             fill = "green") +
+  scale_x_continuous(breaks = seq(from = 2015,
+                                  to = 2023,
+                                  by = 1)) +
+  scale_y_continuous("Population [% Change from January 2015]") +
+  ggtitle("State Population % Change from January 2015") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 2))
+
+tiff(filename = "../tmp/state_population_dpct.tiff",
+     height = 10,
+     width = 18,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+## Daily death by Cause
+
+```{r, fig.height=8,fig.wid = 10}
+p1 <- ggplot(dtus,
+             aes(x = Date,
+                 y = Rate)) +
+  facet_wrap(~ Cause,
+             scale = "free_y") +
+  geom_line() +
+  scale_x_continuous("Year",
+                     breaks = seq.Date(from = min(dtus$Date),
+                                       to = max(dtus$Date),
+                                       by = 365.25)) +
+  scale_y_continuous("Death Rate [Daily Deaths per 10^5 People]") +
+  ggtitle("US Deaths by Cause") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+
+tiff(filename = "../tmp/us_death_daily.tiff",
+     height = 8,
+     width = 10,
+     units = 'in',
+     res = 300,
+     compression = "lzw+p")
+print(p1)
+graphics.off()
+
+p1
+```
+
+## Daily death by Cause and State
+
+```{r}
+pdf(file = "../tmp/rate_state_cause.pdf",
+    width = 16,
+    height = 10)
+
+for (i in 1:nlevels(dt2$Cause)) {
+  p1 <- ggplot(dt2[Cause == levels(dt2$Cause)[i]],
+               aes(x = Date,
+                   y = Rate,
+                   group = Cause)) +
+    facet_wrap(~ State,
+               scale = "free_y") +
+    geom_line() +
+    scale_x_continuous(breaks = seq.Date(from = min(dt2$Date),
+                                         to = max(dt2$Date),
+                                         by = 365.25)) +
+    scale_y_continuous("Death Rate [Daily Deaths per 10^5 People]") +
+    ggtitle(levels(dt2$Cause)[i]) +
+    theme_bw() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90,
+                                     hjust = 1))
+  print(p1)
+}
+
+dev.off()
+```
+
+# Example: diabetes death in CA
+
+```{r}
+dt_ca_db <- droplevels(dt2[Cause == "Diabetes" & 
+                             State == "California",])
+```
+
+## Plot
+```{r,fig.height=4,fig.width=8}
+p1 <- ggplot(dt_ca_db,
+             aes(x = Date,
+                 y = Rate, 
+                 group = Cause)) +
+  facet_wrap(~ State,
+             scale = "free_y") +
+  geom_line(color = "grey") +
+  geom_vline(xintercept = as.Date(c("2019-03-01",
+                                    "2020-03-01",
+                                    "2022-06-01")),
+             color = "red",
+             linetype = "dashed") +
+  annotate(geom = "text", 
+           x = as.Date(c("2016-12-31",
+                         "2019-09-01",
+                         "2021-06-01",
+                         "2023-06-01")), 
+           y = rep(0.11, 4),
+           label = c("Train1",
+                     "Test1",
+                     "COVID",
+                     "Post-COVID"),
+           size = 4) +
+  scale_x_continuous(breaks = seq.Date(from = min(dt2$Date),
+                                       to = max(dt2$Date),
+                                       by = 365.25)) +
+  ggtitle("Death from Diabetes") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 1))
+p1
+```
+
+## LM
+
+```{r}
+dt_ca_db$dt <- as.numeric(dt_ca_db$Date)
+dt_ca_db$dt_sqr <- dt_ca_db$dt^2
+
+m1 <- lm(Rate ~ dt + dt_sqr,
+         data = dt_ca_db[set == "trn1",])
+
+dt_ca_db$prd1 <- predict(m1,
+                         newdata = dt_ca_db)
+```
+
+## Plot LM
+
+```{r,fig.height=4,fig.width=8}
+p2 <- p1 +
+  geom_line(data = dt_ca_db,
+            aes(x = Date,
+                y = prd1),
+            color = "red") 
+
+p2
+```
+
+## NLS
+
+```{r}
+# m2 <- nls(Rate ~ b0 + b1*dt + b2*dt^2 + b3*sin(b4 + b5*dt),
+#            data = dt_ca_db[set == "trn", ],
+#            start = list(fixed = c(b0 = 2.5, # Y-intercept
+#                                   b1 = 1, # linear slope
+#                                   b2 = 1, # square term, i.e. non-linearity of the trend
+#                                   b3 = 10000, # wave magnitude
+#                                   b4 = 1, # sin shift to the left
+#                                   b5 = 0.018)),# wave length(> 1 shortens, < 1 elongates)
+#            control = nlmeControl(maxIter = 500)) 
+
+m2 <- nls(Rate ~ b0 + b1*dt + b2*dt_sqr + b3*sin(b4 + b5*dt),
+          data = dt_ca_db[set == "trn1", ],
+          start = list(b0 = m1$coefficients[1], # Y-intercept
+                       b1 = m1$coefficients[2], # Linear slope
+                       b2 = m1$coefficients[3], # Square term, i.e. non-linearity of the trend
+                       b3 = 10000, # Wave magnitude
+                       b4 = 1, # Sin shift to the left
+                       b5 = 1/60)) # Wave length (> 1 shortens, < 1 elongates)
+```
+
+### Predict NLS
+
+```{r}
+dt_ca_db$prd2 <- predict(m2,
+                         newdata = dt_ca_db)
+
+# Save coefficients
+betas <- summary(m2)$coefficients
+write.csv(betas,
+          file = "../tmp/betas.csv")
+
+betas
+
+# Save Mean Absolute Percent Error (MAPE)
+## All states
+mape <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
+                 by = set]
+mape
+
+## By State
+mape_state <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
+                       by = list(State,
+                                 set)]
+mape_state
+```
+
+### Plot NLS
+
+```{r,fig.height=4,fig.width=8}
+p3 <- p2 +
+  geom_line(data = dt_ca_db,
+            aes(x = Date,
+                y = prd2),
+            color = "blue")
+
+p3
+```
+
+## Seasonality
+
+```{r}
+xx <- spectrum(dt_ca_db$Rate[dt_ca_db$set == "trn1"])
+
+tmp <- data.table(x = 1/xx$freq,
+                  y = xx$spec)
+ggplot(tmp[x < 30],
+       aes(x = x,
+           y = y)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous("Months",
+                     breaks = seq(from = 0,
+                                  to = 200,
+                                  by = 6)) +
+  scale_y_continuous("Spectral Density") +
+  geom_vline(xintercept = c(6, 12),
+             color = "red",
+             linetype = "dashed") +
+  theme_bw()
+```
+
+### Classical Seasonal Decomposition by Moving Averages
+
+```{r,fig.width=6,fig.height=6}
+xx <- ts(data = dt_ca_db$Rate[dt_ca_db$set == "trn1"],
+         frequency = 12)
+
+m11 <- decompose(xx,
+                 type = "additive")
+summary(m11)
+plot(m11)
+```
+
+### Predict seasonal effect and trend
+
+```{r}
+dt_ca_db$seas1 <- dt_ca_db$trend1 <- NA
+dt_ca_db$seas1[dt_ca_db$set == "trn1"] <- c(m11$seasonal)
+dt_ca_db$trend1[dt_ca_db$set == "trn1"] <- c(m11$trend)
+dt_ca_db[, freq1 := seas1 + trend1]
+
+# Predict trend
+tm1 <- lm(trend1 ~ dt + dt_sqr,
+          data = dt_ca_db[set == "trn1", ])
+tm1
+
+dt_ca_db$trend1_pred <- predict(tm1,
+                                newdata = list(dt = dt_ca_db$dt,
+                                               dt_sqr = dt_ca_db$dt_sqr))
+
+dt_ca_db[set == "trn1",
+         freq2 := seas1 + trend1_pred]
+
+# Predict seasonality
+dt_ca_db$seas1_pred <- NA
+dt_ca_db$seas1_pred[1:96] <- rep(dt_ca_db$seas1[1:12],
+                                 rep = 8)
+dt_ca_db$seas1_pred[97:105] <- dt_ca_db$seas1[1:9]
+
+dt_ca_db[, freq3 := seas1_pred + trend1_pred]
+```
+
+### Plot seasonal effect and trend
+
+```{r,fig.height=4,fig.width=8}
+p4 <- p3 +
+  geom_line(data = dt_ca_db,
+            aes(x = Date,
+                y = freq3),
+            color = "darkgreen",
+            linewidth = 1.2)
+p4
+```
+
+# Save MAPE
+
+```{r}
+mape <- dt_ca_db[, .(mape = 100*mean(abs(Rate - freq3)/(Rate))),
+                 by = set]
+mape
+
+## By State
+mape_state <- dt_ca_db[, .(mape = 100*mean(abs(Rate - freq3)/(Rate))),
+                       by = list(State,
+                                 set)]
+mape_state
+```
+
+# Session
+
+```{r}
+sessionInfo()
+```
