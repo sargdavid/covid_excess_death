@@ -14,7 +14,7 @@ self-contained: true
 # Setup
 
 Script Date: 11/2/2023
-Last Updated: 1/2/2025
+Last Updated: 1/10/2025
 
 # Data Subsets
 
@@ -57,6 +57,7 @@ Javier: 1. use "decompose" function (Fourier transform) 2. find top 3 frequencie
 require(data.table)
 require(ggplot2)
 require(nlme)
+require(forecast)
 
 # require(DNAMR)
 ```
@@ -78,17 +79,6 @@ dt1$ICD.10.113.Cause.List[dt1$ICD.10.113.Cause.List == "#Intentional self-harm (
 dt1[is.na(Population), ]
 ```
 Nothing is missing
-
-CA only  
-```{r}
-tmp <- dt1[State == "California" & Year.Code == 2018, ]
-class(tmp$Population)
-
-head(as.integer(tmp$Population))
-
-head(dt1$Population)
-```
-
 
 ## Format variables
 
@@ -134,7 +124,8 @@ dt2[, Rate := 10^5*DeathDaily/Population]
 
 summary(dt2)
 
-unique(dt2$State)
+dt2$State <- factor(dt2$State,
+                    levels = unique(dt2$State))
 
 dt2$Cause <- factor(dt2$Cause,
                     levels = c("COVID-19 (U07.1)",
@@ -421,17 +412,24 @@ dev.off()
 # Example: diabetes death in CA
 
 ```{r}
-dt_ca_db <- droplevels(dt2[Cause == "Diabetes" & 
-                             State == "California",])
+dt3 <- droplevels(dt2[Cause %in% c("Influenza and pneumonia",
+                                   "Diabetes",
+                                   "Lungs",
+                                   "CVD")  & 
+                        State %in% c("California",
+                                     "New Jersey",
+                                     "New York",
+                                     "Pennsylvania",
+                                     "Texas")])
 ```
 
 ## Plot
-```{r,fig.height=4,fig.width=8}
-p1 <- ggplot(dt_ca_db,
+```{r,fig.height=7,fig.width=7}
+p1 <- ggplot(dt3,
              aes(x = Date,
                  y = Rate, 
                  group = Cause)) +
-  facet_wrap(~ State,
+  facet_grid(State ~ Cause,
              scale = "free_y") +
   geom_line(color = "grey") +
   geom_vline(xintercept = as.Date(c("2019-03-01",
@@ -439,21 +437,21 @@ p1 <- ggplot(dt_ca_db,
                                     "2022-06-01")),
              color = "red",
              linetype = "dashed") +
-  annotate(geom = "text", 
-           x = as.Date(c("2016-12-31",
-                         "2019-09-01",
-                         "2021-06-01",
-                         "2023-06-01")), 
-           y = rep(0.11, 4),
-           label = c("Train1",
-                     "Test1",
-                     "COVID",
-                     "Post-COVID"),
-           size = 4) +
-  scale_x_continuous(breaks = seq.Date(from = min(dt2$Date),
-                                       to = max(dt2$Date),
-                                       by = 365.25)) +
-  ggtitle("Death from Diabetes") +
+  # annotate(geom = "text", 
+  #          x = as.Date(c("2016-12-31",
+  #                        "2019-09-01",
+  #                        "2021-06-01",
+  #                        "2023-06-01")), 
+  #          y = rep(0.11, 4),
+  #          label = c("Train1",
+  #                    "Test1",
+  #                    "COVID",
+  #                    "Post-COVID"),
+  #          size = 4) +
+scale_x_continuous(breaks = seq.Date(from = min(dt3$Date),
+                                     to = max(dt3$Date),
+                                     by = 365.25)) +
+  ggtitle("") +
   theme_bw() +
   theme(legend.position = "none",
         axis.text.x = element_text(angle = 90,
@@ -464,21 +462,33 @@ p1
 ## LM
 
 ```{r}
-dt_ca_db$dt <- as.numeric(dt_ca_db$Date)
-dt_ca_db$dt_sqr <- dt_ca_db$dt^2
+dt3$dt <- as.numeric(dt3$Date)
+dt3$dt_sqr <- dt3$dt^2
 
-m1 <- lm(Rate ~ dt + dt_sqr,
-         data = dt_ca_db[set == "trn1",])
 
-dt_ca_db$prd1 <- predict(m1,
-                         newdata = dt_ca_db)
+grd <- expand.grid(State = levels(dt3$State),
+                   Cause = levels(dt3$Cause))
+
+dt3$prd1 <- rep(0, nrow(dt3))
+m1 <- list()
+
+for (i in 1:nrow(grd)) {
+  m1[[i]] <- lm(Rate ~ dt + dt_sqr,
+                data = dt3[set == "trn1" &
+                             State == grd$State[i] &
+                             Cause == grd$Cause[i],])
+  dt3[State == grd$State[i] &
+        Cause == grd$Cause[i],]$prd1 <- predict(m1[[i]],
+                                                newdata = dt3[State == grd$State[i] &
+                                                                Cause == grd$Cause[i],])
+}
 ```
 
 ## Plot LM
 
-```{r,fig.height=4,fig.width=8}
+```{r,fig.height=7,fig.width=7}
 p2 <- p1 +
-  geom_line(data = dt_ca_db,
+  geom_line(data = dt3,
             aes(x = Date,
                 y = prd1),
             color = "red") 
@@ -499,53 +509,96 @@ p2
 #                                   b5 = 0.018)),# wave length(> 1 shortens, < 1 elongates)
 #            control = nlmeControl(maxIter = 500)) 
 
-m2 <- nls(Rate ~ b0 + b1*dt + b2*dt_sqr + b3*sin(b4 + b5*dt),
-          data = dt_ca_db[set == "trn1", ],
-          start = list(b0 = m1$coefficients[1], # Y-intercept
-                       b1 = m1$coefficients[2], # Linear slope
-                       b2 = m1$coefficients[3], # Square term, i.e. non-linearity of the trend
-                       b3 = 10000, # Wave magnitude
-                       b4 = 1, # Sin shift to the left
-                       b5 = 1/60)) # Wave length (> 1 shortens, < 1 elongates)
+# m2 <- nls(Rate ~ b0 + b1*dt + b2*dt_sqr + b3*sin(b4 + b5*dt),
+#           data = dt_ca_db[set == "trn1", ],
+#           start = list(b0 = m1$coefficients[1], # Y-intercept
+#                        b1 = m1$coefficients[2], # Linear slope
+#                        b2 = m1$coefficients[3], # Square term, i.e. non-linearity of the trend
+#                        b3 = 10000, # Wave magnitude
+#                        b4 = 1, # Sin shift to the left
+#                        b5 = 1/60)) # Wave length (> 1 shortens, < 1 elongates)
 ```
 
-### Predict NLS
+```{r}
+# dt_ca_db$prd2 <- predict(m2,
+#                          newdata = dt_ca_db)
+# 
+# # Save coefficients
+# betas <- summary(m2)$coefficients
+# write.csv(betas,
+#           file = "../tmp/betas.csv")
+# 
+# betas
+```
+
 
 ```{r}
-dt_ca_db$prd2 <- predict(m2,
-                         newdata = dt_ca_db)
+dt3$prd2 <- rep(0, nrow(dt3))
+m2 <- list()
+betas <- list()
 
-# Save coefficients
-betas <- summary(m2)$coefficients
-write.csv(betas,
-          file = "../tmp/betas.csv")
-
-betas
-
-# Save Mean Absolute Percent Error (MAPE)
-## All states
-mape <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
-                 by = set]
-mape
-
-## By State
-mape_state <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
-                       by = list(State,
-                                 set)]
-mape_state
+for (i in 1:nrow(grd)) {
+  m2[[i]] <- try({
+    nls(Rate ~ b0 + b1*dt + b2*dt_sqr + b3*sin(b4 + b5*dt),
+        data = dt3[set == "trn1" &
+                     State == grd$State[i] &
+                     Cause == grd$Cause[i],],
+        start = list(b0 = m1[[i]]$coefficients[1], # Y-intercept
+                     b1 = m1[[i]]$coefficients[2], # Linear slope
+                     b2 = m1[[i]]$coefficients[3], # Square term, i.e. non-linearity of the trend
+                     b3 = 10000, # Wave magnitude
+                     b4 = 1, # Sin shift to the left
+                     b5 = 1/60), # Wave length (> 1 shortens, < 1 elongates)
+        control = nls.control(maxiter = 500)) 
+  })
+  
+  if (class(m2[[i]])[1] != "try-error") {
+    dt3[State == grd$State[i] &
+          Cause == grd$Cause[i],]$prd2 <- predict(m2[[i]],
+                                                  newdata = dt3[State == grd$State[i] &
+                                                                  Cause == grd$Cause[i],])
+    
+    betas[[i]] <- summary(m2[[i]])$coefficients
+  }
+}
 ```
 
 ### Plot NLS
 
-```{r,fig.height=4,fig.width=8}
+```{r,fig.height=7,fig.width=7}
 p3 <- p2 +
-  geom_line(data = dt_ca_db,
+  geom_line(data = dt3,
             aes(x = Date,
                 y = prd2),
             color = "blue")
 
 p3
 ```
+
+### Errors
+
+```{r}
+# Mean Square Error
+
+# Mean Absolute Error
+
+# Median Absolute Error
+
+
+# # Save Mean Absolute Percent Error (MAPE)
+# ## All states
+# mape <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
+#                  by = set]
+# mape
+# 
+# ## By State
+# mape_state <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
+#                        by = list(State,
+#                                  set)]
+# mape_state
+```
+
+
 
 ## Seasonality
 
@@ -623,7 +676,7 @@ p4 <- p3 +
 p4
 ```
 
-# Save MAPE
+#### Save MAPE
 
 ```{r}
 mape <- dt_ca_db[, .(mape = 100*mean(abs(Rate - freq3)/(Rate))),
@@ -636,6 +689,75 @@ mape_state <- dt_ca_db[, .(mape = 100*mean(abs(Rate - freq3)/(Rate))),
                                  set)]
 mape_state
 ```
+
+## ARIMA
+
+```{r}
+dt3$prd4 <- rep(0, nrow(dt3))
+m4 <- list()
+
+for (i in 1:nrow(grd)) {
+  m4[[i]] <- try({
+    
+    # # Option 1 from Jin
+    # auto.arima(y = dt3[set == "trn1" &
+    #                      State == grd$State[i] &
+    #                      Cause == grd$Cause[i],]$Rate,
+    #            max.p = 5,
+    #            max.q = 5,
+    #            max.d = 3,
+    #            stepwise = FALSE,
+    #            approximation = FALSE,
+    #            seasonal = TRUE)
+    
+    ## Option 2 from Javier:
+    # arima(x = dt3[set == "trn1" &
+    #                 State == grd$State[i] &
+    #                 Cause == grd$Cause[i],]$Rate,
+    #       order = c(3, 3, 3),
+    #       seasonal = list(order = c(1, 0, 0),
+    #                       period = 12))
+    
+    # Option 3 form Javier (BEST)
+    arima(x = dt3[set == "trn1" &
+                    State == grd$State[i] &
+                    Cause == grd$Cause[i],]$Rate,
+          order = c(4, 1, 1),
+          seasonal = list(order = c(1, 0, 2),
+                          period = 12))
+  })
+  
+  if (class(m4[[i]])[1] != "try-error") {
+    
+    dt3[set == "trn1" &
+    State == grd$State[i] &
+          Cause == grd$Cause[i],]$prd4 <- fitted(m4[[i]])
+    
+    dt3[set != "trn1" &
+          State == grd$State[i] &
+          Cause == grd$Cause[i],]$prd4  <- c(forecast(m4[[i]],
+                                                      nrow(dt3[set != "trn1" &
+                                                                 State == grd$State[i] &
+                                                                 Cause == grd$Cause[i],]))$mean)
+  }
+}
+```
+NOTE: from Javier: we might want to subtract the trend. We can use the estimated trend fro the Seasonal Decomposition model.  
+  
+```{r,fig.height=15,fig.width=15}
+p4 <- p3 +
+  geom_line(data = dt3,
+            aes(x = Date,
+                y = prd4),
+            color = "green",
+            linewidth = 2)
+
+p4
+```
+
+## Exponential Smoothing
+
+Get code from Nuria, repeat same analysis as for the previous models.
 
 # Session
 
