@@ -58,6 +58,7 @@ require(data.table)
 require(ggplot2)
 require(nlme)
 require(forecast)
+require(tensorTS)
 
 # require(DNAMR)
 ```
@@ -484,7 +485,7 @@ for (i in 1:nrow(grd)) {
 }
 ```
 
-## Plot LM
+### Plot LM
 
 ```{r,fig.height=7,fig.width=7}
 p2 <- p1 +
@@ -575,29 +576,100 @@ p3 <- p2 +
 p3
 ```
 
-### Errors
+### Errors in Test 1 set
 
 ```{r}
-# Mean Square Error
-
-# Mean Absolute Error
-
-# Median Absolute Error
-
-
-# # Save Mean Absolute Percent Error (MAPE)
-# ## All states
-# mape <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
-#                  by = set]
-# mape
-# 
-# ## By State
-# mape_state <- dt_ca_db[, .(mape = 100*mean(abs(Rate - prd2)/(Rate))),
-#                        by = list(State,
-#                                  set)]
-# mape_state
+mod2_err <- dt3[set == "tst1",
+                .(mse = mean((Rate - prd2)^2), # Mean Square Error
+                  mae = mean(abs(Rate - prd2)), # Mean Absolute Error
+                  medae = median(abs(Rate - prd2))), # Median Absolute Error
+                by = list(State,
+                          Cause)]
+head(mod2_err)
 ```
 
+### Tensor autoregression
+
+#### Lag 1, 2 anfd 3 of rates
+
+```{r}
+# dt3[, lag1 := c(NA,
+#                 Rate[1:(.N - 1)]),
+#     by = list(State,
+#               Cause)]
+# 
+# dt3[, lag2 := c(NA,
+#                 NA,
+#                 Rate[1:(.N - 2)]),
+#     by = list(State,
+#               Cause)]
+# 
+# dt3[, lag3 := c(NA,
+#                 NA,
+#                 NA,
+#                 Rate[1:(.N - 3)]),
+#     by = list(State,
+#               Cause)]
+# 
+# dt4 <- droplevels(dt3[!is.na(lag3), ])
+```
+
+#### Set up 3D array for tensor
+
+```{r}
+# Contingency table
+ct1 <- xtabs(Rate ~ Date +
+               State +
+               Cause, 
+             data = dt3[set == "trn1", ])
+
+xx <- array(as.matrix(ct1), 
+            dim = c(length(levels(as.factor(dt3$Date))), 
+                    length(levels(as.factor(dt3$State))), 
+                    length(levels(as.factor(dt3$Cause)))))
+
+dimnames(xx) <- list(levels(as.factor(dt3$Date)), 
+                     levels(as.factor(dt3$State)), 
+                     levels(as.factor(dt3$Cause)))
+```
+
+
+#### Set up the model
+```{r}
+mm1 <- tensorTS::tenAR.est(xx = xx)
+summary(mm1)
+mm1$A
+
+res_mm1 <- as.data.table(mm1$res)
+names(res_mm1) <- c("Date",
+                    "State",
+                    "Cause",
+                    "prd2_tensor_res")
+
+res_mm1$Date <- as.Date(res_mm1$Date)
+
+dt3 <- merge(dt3,
+             res_mm1,
+             by = c("Date",
+                    "State",
+                    "Cause"),
+             all.x = TRUE)
+
+dt3$prd2_tensor <- dt3$Rate +
+  dt3$prd2_tensor_res
+```
+
+### Plot tensor predictions
+
+```{r,fig.height=7,fig.width=7}
+p31 <- p3 +
+  geom_line(data = dt3,
+            aes(x = Date,
+                y = prd2_tensor),
+            color = "red")
+
+p31
+```
 
 
 ## Seasonality
@@ -730,7 +802,7 @@ for (i in 1:nrow(grd)) {
   if (class(m4[[i]])[1] != "try-error") {
     
     dt3[set == "trn1" &
-    State == grd$State[i] &
+          State == grd$State[i] &
           Cause == grd$Cause[i],]$prd4 <- fitted(m4[[i]])
     
     dt3[set != "trn1" &
@@ -743,7 +815,7 @@ for (i in 1:nrow(grd)) {
 }
 ```
 NOTE: from Javier: we might want to subtract the trend. We can use the estimated trend fro the Seasonal Decomposition model.  
-  
+
 ```{r,fig.height=15,fig.width=15}
 p4 <- p3 +
   geom_line(data = dt3,
